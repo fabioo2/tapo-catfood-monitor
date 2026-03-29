@@ -4,12 +4,14 @@ import json
 import asyncio
 import logging
 from datetime import datetime
+from pathlib import Path
 
 import aiohttp
 import discord
 from discord.ext import commands
 from google import genai
 from google.genai import types
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -22,12 +24,14 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 CAMERA_NAME = os.environ.get("CAMERA_NAME", "your_camera")
 CAMERA_ENTITY = f"camera.{CAMERA_NAME}_live_view"
 CAMERA_SWITCH_ENTITY = f"switch.{CAMERA_NAME}"
+camera_config_entry_id = ""  # Auto-detected at startup
 POLL_INTERVAL_SEC = int(os.environ.get("POLL_INTERVAL_SEC", "600"))
 LOW_FOOD_THRESHOLD = int(os.environ.get("LOW_FOOD_THRESHOLD", "15"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 CAMERA_PRIVACY_MODE = os.environ.get("CAMERA_PRIVACY_MODE", "false").lower() == "true"
 CAMERA_WAKE_SEC = int(os.environ.get("CAMERA_WAKE_SEC", "5"))
-camera_config_entry_id = ""  # Auto-detected at startup
+BASELINE_THRESHOLD = int(os.environ.get("BASELINE_THRESHOLD", "25"))
+BASELINE_PATH = Path(os.environ.get("BASELINE_PATH", "/app/data/baseline.jpg"))
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -72,10 +76,48 @@ camera_down = False
 alerted_empty = False
 consecutive_errors = 0
 error_alerted = False
+baseline_alerted = False
 
 
 def snapshot_filename():
     return f"catfood_{int(datetime.now().timestamp())}.jpg"
+
+
+# ---------------------------------------------------------------------------
+# Baseline image comparison
+# ---------------------------------------------------------------------------
+def save_baseline(image_bytes):
+    BASELINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    BASELINE_PATH.write_bytes(image_bytes)
+    log.info("Baseline saved to %s", BASELINE_PATH)
+
+
+def load_baseline():
+    if BASELINE_PATH.exists():
+        return BASELINE_PATH.read_bytes()
+    return None
+
+
+def compare_to_baseline(image_bytes):
+    """Compare image to baseline. Returns difference percentage (0-100)."""
+    baseline_bytes = load_baseline()
+    if baseline_bytes is None:
+        return None
+
+    baseline_img = Image.open(io.BytesIO(baseline_bytes)).convert("L").resize((64, 64))
+    current_img = Image.open(io.BytesIO(image_bytes)).convert("L").resize((64, 64))
+
+    baseline_px = list(baseline_img.getdata())
+    current_px = list(current_img.getdata())
+
+    diff = sum(abs(b - c) for b, c in zip(baseline_px, current_px))
+    max_diff = 255 * len(baseline_px)
+    pct = (diff / max_diff) * 100
+
+    log.info("Baseline drift: %.1f%% (threshold: %d%%)", pct, BASELINE_THRESHOLD)
+    return pct
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +138,7 @@ async def set_camera_power(session, on: bool):
 
 
 # ---------------------------------------------------------------------------
-# Integration reload for fresh frames
+# Camera snapshot via Home Assistant
 # ---------------------------------------------------------------------------
 async def detect_config_entry_id():
     """Auto-detect the TP-Link config entry ID for the camera."""
@@ -130,9 +172,6 @@ async def reload_camera_integration(session, headers):
             log.warning("Failed to reload camera integration: HTTP %d", resp.status)
 
 
-# ---------------------------------------------------------------------------
-# Camera snapshot via Home Assistant
-# ---------------------------------------------------------------------------
 async def get_camera_snapshot():
     global ha_down, camera_down
     headers = {"Authorization": f"Bearer {HA_TOKEN}"}
@@ -245,6 +284,11 @@ async def analyze_food():
         last_check_time = datetime.now()
         consecutive_errors = 0
         error_alerted = False
+
+        drift = compare_to_baseline(image_bytes)
+        if drift is not None:
+            analysis["baseline_drift"] = round(drift, 1)
+
         return image_bytes, analysis
 
     except aiohttp.ClientError as e:
@@ -291,7 +335,7 @@ def build_analysis_embed(analysis, manual=False):
 # Monitor loop
 # ---------------------------------------------------------------------------
 async def monitor_loop():
-    global monitoring, consecutive_errors, error_alerted, alerted_empty
+    global monitoring, consecutive_errors, error_alerted, alerted_empty, baseline_alerted
 
     await bot.wait_until_ready()
     channel = bot.get_channel(DISCORD_CHANNEL_ID) or await bot.fetch_channel(DISCORD_CHANNEL_ID)
@@ -362,6 +406,29 @@ async def monitor_loop():
                     await channel.send(embed=embed, file=file)
                     log.info("Food refilled notification: level=%s%%", level)
 
+                # Baseline drift check
+                drift = analysis.get("baseline_drift")
+                if drift is not None and drift >= BASELINE_THRESHOLD and not baseline_alerted:
+                    baseline_alerted = True
+                    embed = discord.Embed(
+                        title="Camera May Have Moved",
+                        description=(
+                            f"Image differs **{drift:.1f}%** from baseline "
+                            f"(threshold: {BASELINE_THRESHOLD}%).\n\n"
+                            "Food readings may be unreliable. "
+                            "Use `!baseline` to set a new baseline if the camera was repositioned."
+                        ),
+                        color=discord.Color.orange(),
+                    )
+                    fname = snapshot_filename()
+                    file = discord.File(io.BytesIO(image_bytes), filename=fname)
+                    embed.set_image(url=f"attachment://{fname}")
+                    await channel.send(embed=embed, file=file)
+                    log.warning("Baseline drift alert: %.1f%%", drift)
+                elif drift is not None and drift < BASELINE_THRESHOLD and baseline_alerted:
+                    baseline_alerted = False
+                    log.info("Baseline drift returned to normal: %.1f%%", drift)
+
         except Exception as e:
             log.exception("Monitor loop error: %s", e)
 
@@ -385,6 +452,7 @@ async def on_ready():
             "`!start` - Start monitoring the food bowl\n"
             "`!stop` - Stop monitoring\n"
             "`!check` - One-time food level check\n"
+            "`!baseline` - Set baseline image for drift detection\n"
             "`!status` - Show bot status"
         ),
         color=discord.Color.blue(),
@@ -480,6 +548,39 @@ async def check(ctx):
 
 
 @bot.command()
+async def baseline(ctx):
+    """Set baseline image for camera drift detection."""
+    log.info("Baseline set requested by %s", ctx.author)
+    async with ctx.typing():
+        image_bytes = await get_camera_snapshot()
+
+    if image_bytes is None:
+        await ctx.send(embed=discord.Embed(
+            title="Baseline Failed",
+            description="Could not capture snapshot. Check logs for details.",
+            color=discord.Color.red(),
+        ))
+        return
+
+    global baseline_alerted
+    save_baseline(image_bytes)
+    baseline_alerted = False
+
+    embed = discord.Embed(
+        title="Baseline Set",
+        description=(
+            f"Saved as reference image. I'll alert you if the camera view "
+            f"drifts more than **{BASELINE_THRESHOLD}%** from this."
+        ),
+        color=discord.Color.green(),
+    )
+    fname = snapshot_filename()
+    file = discord.File(io.BytesIO(image_bytes), filename=fname)
+    embed.set_image(url=f"attachment://{fname}")
+    await ctx.send(embed=embed, file=file)
+
+
+@bot.command()
 async def status(ctx):
     """Show current bot status."""
     lines = [
@@ -488,6 +589,7 @@ async def status(ctx):
         f"**Low food threshold:** {LOW_FOOD_THRESHOLD}%",
         f"**Camera:** `{CAMERA_ENTITY}`",
         f"**Gemini model:** `{GEMINI_MODEL}`",
+        f"**Baseline:** {'Set' if load_baseline() else 'Not set'} (threshold: {BASELINE_THRESHOLD}%)",
         f"**HA connected:** {'No' if ha_down else 'Yes'}",
         f"**Gemini connected:** {'No' if gemini_down else 'Yes'}",
         f"**Camera connected:** {'No' if camera_down else 'Yes'}",
@@ -498,6 +600,9 @@ async def status(ctx):
             f"**Last result:** Food={'Yes' if last_analysis.get('food') else 'No'}, "
             f"Level={last_analysis.get('level', '?')}%"
         )
+        drift = last_analysis.get("baseline_drift")
+        if drift is not None:
+            lines.append(f"**Baseline drift:** {drift}%")
 
     await ctx.send(embed=discord.Embed(
         title="Cat Food Monitor Status",
