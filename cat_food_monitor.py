@@ -19,12 +19,13 @@ HA_TOKEN = os.environ["HA_TOKEN"]
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 DISCORD_CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-CAMERA_ENTITY = os.environ.get("CAMERA_ENTITY", "camera.your_camera_live_view")
+CAMERA_NAME = os.environ.get("CAMERA_NAME", "your_camera")
+CAMERA_ENTITY = f"camera.{CAMERA_NAME}_live_view"
+CAMERA_SWITCH_ENTITY = f"switch.{CAMERA_NAME}"
 POLL_INTERVAL_SEC = int(os.environ.get("POLL_INTERVAL_SEC", "600"))
 LOW_FOOD_THRESHOLD = int(os.environ.get("LOW_FOOD_THRESHOLD", "15"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 CAMERA_PRIVACY_MODE = os.environ.get("CAMERA_PRIVACY_MODE", "false").lower() == "true"
-CAMERA_SWITCH_ENTITY = os.environ.get("CAMERA_SWITCH_ENTITY", "switch.your_camera")
 CAMERA_WAKE_SEC = int(os.environ.get("CAMERA_WAKE_SEC", "15"))
 
 # ---------------------------------------------------------------------------
@@ -101,11 +102,31 @@ async def get_camera_snapshot():
     headers = {"Authorization": f"Bearer {HA_TOKEN}"}
 
     async with aiohttp.ClientSession() as session:
+        was_already_on = False
         if CAMERA_PRIVACY_MODE:
-            await set_camera_power(session, on=True)
-            await asyncio.sleep(CAMERA_WAKE_SEC)
+            # Check current state before toggling
+            state_url = f"{HA_URL}/api/states/{CAMERA_SWITCH_ENTITY}"
+            async with session.get(state_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    was_already_on = data.get("state") == "on"
+            if not was_already_on:
+                await set_camera_power(session, on=True)
+                # Wait for camera entity to become available
+                for _ in range(10):
+                    await asyncio.sleep(CAMERA_WAKE_SEC)
+                    cam_url = f"{HA_URL}/api/states/{CAMERA_ENTITY}"
+                    async with session.get(cam_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            cam_data = await resp.json()
+                            if cam_data.get("state") not in ("unavailable", "unknown"):
+                                log.info("Camera ready (state=%s)", cam_data.get("state"))
+                                break
+                    log.info("Waiting for camera to become available...")
+            else:
+                log.info("Camera already on, skipping power toggle")
 
-        url = f"{HA_URL}/api/camera_proxy/{CAMERA_ENTITY}"
+        url = f"{HA_URL}/api/camera_proxy/{CAMERA_ENTITY}?t={int(datetime.now().timestamp())}"
         max_retries = 6 if CAMERA_PRIVACY_MODE else 1
         try:
             for attempt in range(max_retries):
@@ -134,7 +155,7 @@ async def get_camera_snapshot():
                         camera_down = True
                     return None
         finally:
-            if CAMERA_PRIVACY_MODE:
+            if CAMERA_PRIVACY_MODE and not was_already_on:
                 await set_camera_power(session, on=False)
 
 

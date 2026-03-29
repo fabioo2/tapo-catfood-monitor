@@ -66,18 +66,17 @@ All configuration is done through environment variables in `.env`. See `.env.exa
 | `DISCORD_BOT_TOKEN` | Discord bot token |
 | `DISCORD_CHANNEL_ID` | Discord channel ID for alerts |
 | `GEMINI_API_KEY` | Google Gemini API key |
+| `CAMERA_NAME` | Your Tapo camera name in Home Assistant (used to derive `camera.{name}_live_view` and `switch.{name}`) |
 
 ### Optional
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HA_URL` | `http://homeassistant:8123` | Home Assistant URL |
-| `CAMERA_ENTITY` | `camera.your_camera_live_view` | Camera entity ID in Home Assistant |
 | `POLL_INTERVAL_SEC` | `600` | How often to check the bowl (seconds) |
 | `LOW_FOOD_THRESHOLD` | `15` | Food level (%) that triggers an alert |
 | `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model to use |
 | `CAMERA_PRIVACY_MODE` | `false` | Turn camera on/off for each snapshot |
-| `CAMERA_SWITCH_ENTITY` | `switch.your_camera` | HA switch entity that controls camera power |
 | `CAMERA_WAKE_SEC` | `15` | Seconds to wait after turning camera on |
 
 ### Privacy mode
