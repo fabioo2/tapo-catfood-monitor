@@ -5,6 +5,6 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      - TZ=America/Toronto
+      - TZ=${TZ:-UTC}
     dns:
-      - 192.168.0.187
+      - ${DNS_SERVER:-8.8.8.8}

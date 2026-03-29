@@ -113,9 +113,8 @@ The free tier for `gemini-2.5-flash-lite` allows **1,000 requests/day**. Some re
 
 ## Timezone
 
-The Docker container defaults to UTC. Set your timezone in `docker-compose.yml`:
+The Docker container defaults to UTC. Set your timezone in `.env`:
 
-```yaml
-environment:
-  - TZ=America/Toronto
+```
+TZ=America/New_York
 ```

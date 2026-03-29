@@ -26,7 +26,8 @@ POLL_INTERVAL_SEC = int(os.environ.get("POLL_INTERVAL_SEC", "600"))
 LOW_FOOD_THRESHOLD = int(os.environ.get("LOW_FOOD_THRESHOLD", "15"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 CAMERA_PRIVACY_MODE = os.environ.get("CAMERA_PRIVACY_MODE", "false").lower() == "true"
-CAMERA_WAKE_SEC = int(os.environ.get("CAMERA_WAKE_SEC", "15"))
+CAMERA_WAKE_SEC = int(os.environ.get("CAMERA_WAKE_SEC", "5"))
+camera_config_entry_id = ""  # Auto-detected at startup
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -95,6 +96,41 @@ async def set_camera_power(session, on: bool):
 
 
 # ---------------------------------------------------------------------------
+# Integration reload for fresh frames
+# ---------------------------------------------------------------------------
+async def detect_config_entry_id():
+    """Auto-detect the TP-Link config entry ID for the camera."""
+    global camera_config_entry_id
+    headers = {"Authorization": f"Bearer {HA_TOKEN}"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{HA_URL}/api/config/config_entries/entry", headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    entries = await resp.json()
+                    for entry in entries:
+                        if entry.get("domain") == "tplink" and CAMERA_NAME.lower() in entry.get("title", "").lower():
+                            camera_config_entry_id = entry["entry_id"]
+                            log.info("Auto-detected config entry: %s (%s)", entry["title"], camera_config_entry_id)
+                            return
+                    log.warning("Could not find tplink config entry matching '%s'", CAMERA_NAME)
+    except Exception as e:
+        log.error("Failed to detect config entry ID: %s", e)
+
+
+async def reload_camera_integration(session, headers):
+    """Reload the TP-Link config entry to force HA to fetch a fresh frame."""
+    if not camera_config_entry_id:
+        return
+    url = f"{HA_URL}/api/services/homeassistant/reload_config_entry"
+    payload = {"entry_id": camera_config_entry_id}
+    async with session.post(url, headers={**headers, "Content-Type": "application/json"}, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        if resp.status == 200:
+            log.info("Reloaded camera integration for fresh frame")
+        else:
+            log.warning("Failed to reload camera integration: HTTP %d", resp.status)
+
+
+# ---------------------------------------------------------------------------
 # Camera snapshot via Home Assistant
 # ---------------------------------------------------------------------------
 async def get_camera_snapshot():
@@ -104,7 +140,6 @@ async def get_camera_snapshot():
     async with aiohttp.ClientSession() as session:
         was_already_on = False
         if CAMERA_PRIVACY_MODE:
-            # Check current state before toggling
             state_url = f"{HA_URL}/api/states/{CAMERA_SWITCH_ENTITY}"
             async with session.get(state_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
@@ -112,19 +147,13 @@ async def get_camera_snapshot():
                     was_already_on = data.get("state") == "on"
             if not was_already_on:
                 await set_camera_power(session, on=True)
-                # Wait for camera entity to become available
-                for _ in range(10):
-                    await asyncio.sleep(CAMERA_WAKE_SEC)
-                    cam_url = f"{HA_URL}/api/states/{CAMERA_ENTITY}"
-                    async with session.get(cam_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        if resp.status == 200:
-                            cam_data = await resp.json()
-                            if cam_data.get("state") not in ("unavailable", "unknown"):
-                                log.info("Camera ready (state=%s)", cam_data.get("state"))
-                                break
-                    log.info("Waiting for camera to become available...")
+                await asyncio.sleep(CAMERA_WAKE_SEC)
             else:
                 log.info("Camera already on, skipping power toggle")
+
+        # Reload integration to get a fresh frame from the camera
+        await reload_camera_integration(session, headers)
+        await asyncio.sleep(CAMERA_WAKE_SEC)
 
         url = f"{HA_URL}/api/camera_proxy/{CAMERA_ENTITY}?t={int(datetime.now().timestamp())}"
         max_retries = 6 if CAMERA_PRIVACY_MODE else 1
@@ -347,6 +376,7 @@ async def monitor_loop():
 @bot.event
 async def on_ready():
     log.info("Cat food monitor online as %s", bot.user)
+    await detect_config_entry_id()
     channel = bot.get_channel(DISCORD_CHANNEL_ID) or await bot.fetch_channel(DISCORD_CHANNEL_ID)
     embed = discord.Embed(
         title="Cat Food Monitor Online",
