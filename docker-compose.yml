@@ -1,0 +1,10 @@
+services:
+  cat-food-monitor:
+    build: .
+    container_name: cat-food-monitor
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - TZ=America/Toronto
+    dns:
+      - 192.168.0.187

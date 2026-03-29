@@ -1,0 +1,461 @@
+import os
+import io
+import json
+import asyncio
+import logging
+from datetime import datetime
+
+import aiohttp
+import discord
+from discord.ext import commands
+from google import genai
+from google.genai import types
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+HA_URL = os.environ.get("HA_URL", "http://homeassistant:8123")
+HA_TOKEN = os.environ["HA_TOKEN"]
+DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+DISCORD_CHANNEL_ID = int(os.environ["DISCORD_CHANNEL_ID"])
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+CAMERA_ENTITY = os.environ.get("CAMERA_ENTITY", "camera.your_camera_live_view")
+POLL_INTERVAL_SEC = int(os.environ.get("POLL_INTERVAL_SEC", "600"))
+LOW_FOOD_THRESHOLD = int(os.environ.get("LOW_FOOD_THRESHOLD", "15"))
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+CAMERA_PRIVACY_MODE = os.environ.get("CAMERA_PRIVACY_MODE", "false").lower() == "true"
+CAMERA_SWITCH_ENTITY = os.environ.get("CAMERA_SWITCH_ENTITY", "switch.your_camera")
+CAMERA_WAKE_SEC = int(os.environ.get("CAMERA_WAKE_SEC", "15"))
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("catfood")
+
+# ---------------------------------------------------------------------------
+# Gemini client
+# ---------------------------------------------------------------------------
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+ANALYSIS_PROMPT = (
+    "Analyze this image of a cat food bowl. Determine:\n"
+    "1. Whether there is food visible in the bowl (true/false)\n"
+    "2. The estimated food level as a percentage (0-100)\n\n"
+    "Respond with ONLY a JSON object in this exact format, no other text:\n"
+    '{"food": true, "level": 75}\n\n'
+    '- "food": true if any food is visible, false if the bowl appears empty\n'
+    '- "level": estimated fullness 0 (empty) to 100 (full)'
+)
+
+# ---------------------------------------------------------------------------
+# Bot setup
+# ---------------------------------------------------------------------------
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+# Monitoring state
+monitoring = False
+monitor_task = None
+last_analysis = None
+last_check_time = None
+ha_down = False
+gemini_down = False
+camera_down = False
+alerted_empty = False
+consecutive_errors = 0
+error_alerted = False
+
+
+def snapshot_filename():
+    return f"catfood_{int(datetime.now().timestamp())}.jpg"
+
+
+# ---------------------------------------------------------------------------
+# Camera power control via Home Assistant
+# ---------------------------------------------------------------------------
+async def set_camera_power(session, on: bool):
+    service = "turn_on" if on else "turn_off"
+    url = f"{HA_URL}/api/services/switch/{service}"
+    headers = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
+    payload = {"entity_id": CAMERA_SWITCH_ENTITY}
+
+    async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        if resp.status == 200:
+            log.info("Camera %s", "on" if on else "off")
+        else:
+            body = await resp.text()
+            log.error("Camera %s failed: HTTP %d - %s", service, resp.status, body[:200])
+
+
+# ---------------------------------------------------------------------------
+# Camera snapshot via Home Assistant
+# ---------------------------------------------------------------------------
+async def get_camera_snapshot():
+    global ha_down, camera_down
+    headers = {"Authorization": f"Bearer {HA_TOKEN}"}
+
+    async with aiohttp.ClientSession() as session:
+        if CAMERA_PRIVACY_MODE:
+            await set_camera_power(session, on=True)
+            await asyncio.sleep(CAMERA_WAKE_SEC)
+
+        url = f"{HA_URL}/api/camera_proxy/{CAMERA_ENTITY}"
+        max_retries = 6 if CAMERA_PRIVACY_MODE else 1
+        try:
+            for attempt in range(max_retries):
+                async with session.get(
+                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+                ) as resp:
+                    if resp.status == 200:
+                        if camera_down:
+                            camera_down = False
+                            log.info("Camera connection restored")
+                        if ha_down:
+                            ha_down = False
+                            log.info("Home Assistant connection restored")
+                        return await resp.read()
+
+                    if resp.status == 503 and attempt < max_retries - 1:
+                        log.info("Camera not ready, retrying in 5s (%d/%d)", attempt + 1, max_retries)
+                        await asyncio.sleep(5)
+                        continue
+
+                    body = await resp.text()
+                    log.error("Camera snapshot failed: HTTP %d - %s", resp.status, body[:200])
+                    if resp.status in (401, 403):
+                        ha_down = True
+                    else:
+                        camera_down = True
+                    return None
+        finally:
+            if CAMERA_PRIVACY_MODE:
+                await set_camera_power(session, on=False)
+
+
+# ---------------------------------------------------------------------------
+# Gemini image analysis
+# ---------------------------------------------------------------------------
+async def analyze_with_gemini(image_bytes):
+    global gemini_down
+    try:
+        response = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=GEMINI_MODEL,
+            contents=[
+                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                ANALYSIS_PROMPT,
+            ],
+        )
+
+        text = response.text.strip()
+        # Strip markdown code fences if the model wraps them
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+            text = text.rsplit("```", 1)[0].strip()
+
+        result = json.loads(text)
+
+        if gemini_down:
+            gemini_down = False
+            log.info("Gemini API connection restored")
+
+        log.info("Gemini analysis: food=%s, level=%s%%", result.get("food"), result.get("level"))
+        return result
+
+    except json.JSONDecodeError:
+        log.error("Gemini returned invalid JSON: %s", response.text[:300])
+        return None
+    except Exception as e:
+        log.error("Gemini API error: %s", e)
+        gemini_down = True
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Full analysis pipeline
+# ---------------------------------------------------------------------------
+async def analyze_food():
+    global last_analysis, last_check_time, consecutive_errors, error_alerted
+    try:
+        image_bytes = await get_camera_snapshot()
+        if image_bytes is None:
+            return None
+
+        analysis = await analyze_with_gemini(image_bytes)
+        if analysis is None:
+            return None
+
+        last_analysis = analysis
+        last_check_time = datetime.now()
+        consecutive_errors = 0
+        error_alerted = False
+        return image_bytes, analysis
+
+    except aiohttp.ClientError as e:
+        log.error("Network error during analysis: %s", e)
+        return None
+    except Exception as e:
+        log.error("Unexpected error during analysis: %s", e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Embed builder
+# ---------------------------------------------------------------------------
+def build_analysis_embed(analysis, manual=False):
+    food = analysis.get("food", False)
+    level = analysis.get("level", 0)
+
+    if not food or level == 0:
+        color = discord.Color.red()
+        title = "Cat Food Check: Empty!" if manual else "Bowl is Empty!"
+    elif level <= LOW_FOOD_THRESHOLD:
+        color = discord.Color.orange()
+        title = "Cat Food Check: Low" if manual else "Food Running Low"
+    elif level <= 50:
+        color = discord.Color.yellow()
+        title = "Cat Food Check"
+    else:
+        color = discord.Color.green()
+        title = "Cat Food Check: Looking Good!"
+
+    embed = discord.Embed(title=title, color=color)
+
+    filled = round(level / 10)
+    bar = "\u2588" * filled + "\u2591" * (10 - filled)
+
+    embed.add_field(name="Food Present", value="Yes" if food else "No", inline=True)
+    embed.add_field(name="Level", value=f"{level}%", inline=True)
+    embed.add_field(name="", value=f"`[{bar}]`", inline=False)
+    embed.set_footer(text=f"Checked at {datetime.now().strftime('%I:%M %p')}")
+    return embed
+
+
+# ---------------------------------------------------------------------------
+# Monitor loop
+# ---------------------------------------------------------------------------
+async def monitor_loop():
+    global monitoring, consecutive_errors, error_alerted, alerted_empty
+
+    await bot.wait_until_ready()
+    channel = bot.get_channel(DISCORD_CHANNEL_ID) or await bot.fetch_channel(DISCORD_CHANNEL_ID)
+    log.info("Monitor loop started (interval=%ds)", POLL_INTERVAL_SEC)
+
+    while monitoring and not bot.is_closed():
+        try:
+            result = await analyze_food()
+
+            if result is None:
+                consecutive_errors += 1
+                log.warning("Analysis failed (consecutive errors: %d)", consecutive_errors)
+
+                if consecutive_errors >= 3 and not error_alerted:
+                    error_alerted = True
+                    issues = []
+                    if ha_down:
+                        issues.append("Home Assistant unreachable")
+                    if camera_down:
+                        issues.append("Camera unavailable")
+                    if gemini_down:
+                        issues.append("Gemini API error")
+                    if not issues:
+                        issues.append("Unknown error")
+
+                    embed = discord.Embed(
+                        title="Cat Food Monitor Issue",
+                        description=(
+                            f"**{consecutive_errors} consecutive check failures.**\n"
+                            f"Issues: {', '.join(issues)}\n\n"
+                            "Monitoring continues -- I'll update you when it recovers."
+                        ),
+                        color=discord.Color.orange(),
+                    )
+                    await channel.send(embed=embed)
+            else:
+                if error_alerted:
+                    embed = discord.Embed(
+                        title="Cat Food Monitor Recovered",
+                        description="Connection restored. Monitoring resumed normally.",
+                        color=discord.Color.green(),
+                    )
+                    await channel.send(embed=embed)
+
+                image_bytes, analysis = result
+                food = analysis.get("food", False)
+                level = analysis.get("level", 0)
+
+                if (not food or level <= LOW_FOOD_THRESHOLD) and not alerted_empty:
+                    alerted_empty = True
+                    embed = build_analysis_embed(analysis)
+                    fname = snapshot_filename()
+                    file = discord.File(io.BytesIO(image_bytes), filename=fname)
+                    embed.set_image(url=f"attachment://{fname}")
+                    await channel.send(embed=embed, file=file)
+                    log.warning("Low food alert sent: food=%s, level=%s%%", food, level)
+
+                elif food and level > LOW_FOOD_THRESHOLD and alerted_empty:
+                    alerted_empty = False
+                    embed = discord.Embed(
+                        title="Food Bowl Refilled!",
+                        description=f"Food level is back up to **{level}%**.",
+                        color=discord.Color.green(),
+                    )
+                    fname = snapshot_filename()
+                    file = discord.File(io.BytesIO(image_bytes), filename=fname)
+                    embed.set_image(url=f"attachment://{fname}")
+                    await channel.send(embed=embed, file=file)
+                    log.info("Food refilled notification: level=%s%%", level)
+
+        except Exception as e:
+            log.exception("Monitor loop error: %s", e)
+
+        await asyncio.sleep(POLL_INTERVAL_SEC)
+
+    log.info("Monitor loop ended")
+
+
+# ---------------------------------------------------------------------------
+# Discord events
+# ---------------------------------------------------------------------------
+@bot.event
+async def on_ready():
+    log.info("Cat food monitor online as %s", bot.user)
+    channel = bot.get_channel(DISCORD_CHANNEL_ID) or await bot.fetch_channel(DISCORD_CHANNEL_ID)
+    embed = discord.Embed(
+        title="Cat Food Monitor Online",
+        description=(
+            "Commands:\n"
+            "`!start` - Start monitoring the food bowl\n"
+            "`!stop` - Stop monitoring\n"
+            "`!check` - One-time food level check\n"
+            "`!status` - Show bot status"
+        ),
+        color=discord.Color.blue(),
+    )
+    await channel.send(embed=embed)
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return  # Silently ignore unknown commands
+    log.error("Command error: %s", error)
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+@bot.command()
+async def start(ctx):
+    """Start monitoring cat food bowl."""
+    global monitoring, monitor_task, alerted_empty, consecutive_errors, error_alerted
+
+    if monitoring:
+        await ctx.send(embed=discord.Embed(
+            description="Already monitoring! Use `!stop` to stop.",
+            color=discord.Color.orange(),
+        ))
+        return
+
+    monitoring = True
+    alerted_empty = False
+    consecutive_errors = 0
+    error_alerted = False
+    monitor_task = bot.loop.create_task(monitor_loop())
+    log.info("Monitoring started by %s", ctx.author)
+
+    await ctx.send(embed=discord.Embed(
+        title="Monitoring Started",
+        description=(
+            f"Checking food bowl every **{POLL_INTERVAL_SEC // 60} minutes**.\n"
+            f"I'll alert you if the food drops below **{LOW_FOOD_THRESHOLD}%**."
+        ),
+        color=discord.Color.green(),
+    ))
+
+
+@bot.command()
+async def stop(ctx):
+    """Stop monitoring cat food bowl."""
+    global monitoring, monitor_task
+
+    if not monitoring:
+        await ctx.send(embed=discord.Embed(
+            description="Not currently monitoring. Use `!start` to begin.",
+            color=discord.Color.orange(),
+        ))
+        return
+
+    monitoring = False
+    if monitor_task:
+        monitor_task.cancel()
+        monitor_task = None
+    log.info("Monitoring stopped by %s", ctx.author)
+
+    await ctx.send(embed=discord.Embed(
+        title="Monitoring Stopped",
+        description="Cat food monitoring has been stopped.",
+        color=discord.Color.red(),
+    ))
+
+
+@bot.command()
+async def check(ctx):
+    """One-time check of cat food level."""
+    log.info("Manual check requested by %s", ctx.author)
+    async with ctx.typing():
+        result = await analyze_food()
+
+    if result is None:
+        await ctx.send(embed=discord.Embed(
+            title="Check Failed",
+            description="Could not analyze the food bowl. Check logs for details.",
+            color=discord.Color.red(),
+        ))
+        return
+
+    image_bytes, analysis = result
+    embed = build_analysis_embed(analysis, manual=True)
+    fname = snapshot_filename()
+    file = discord.File(io.BytesIO(image_bytes), filename=fname)
+    embed.set_image(url=f"attachment://{fname}")
+    await ctx.send(embed=embed, file=file)
+
+
+@bot.command()
+async def status(ctx):
+    """Show current bot status."""
+    lines = [
+        f"**Monitoring:** {'Active' if monitoring else 'Inactive'}",
+        f"**Poll interval:** {POLL_INTERVAL_SEC // 60} minutes",
+        f"**Low food threshold:** {LOW_FOOD_THRESHOLD}%",
+        f"**Camera:** `{CAMERA_ENTITY}`",
+        f"**Gemini model:** `{GEMINI_MODEL}`",
+        f"**HA connected:** {'No' if ha_down else 'Yes'}",
+        f"**Gemini connected:** {'No' if gemini_down else 'Yes'}",
+        f"**Camera connected:** {'No' if camera_down else 'Yes'}",
+    ]
+    if last_analysis and last_check_time:
+        lines.append(f"**Last check:** {last_check_time.strftime('%I:%M %p')}")
+        lines.append(
+            f"**Last result:** Food={'Yes' if last_analysis.get('food') else 'No'}, "
+            f"Level={last_analysis.get('level', '?')}%"
+        )
+
+    await ctx.send(embed=discord.Embed(
+        title="Cat Food Monitor Status",
+        description="\n".join(lines),
+        color=discord.Color.blue(),
+    ))
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+bot.run(DISCORD_BOT_TOKEN, log_handler=None)
