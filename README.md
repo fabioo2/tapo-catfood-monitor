@@ -4,6 +4,8 @@ A Discord bot that monitors your cat's food bowl using a Tapo camera and Google 
 
 Runs entirely on **Gemini's free tier** -- at the default 10-minute polling interval, it uses ~144 requests/day out of the 1,000/day free limit.
 
+<img width="509" height="399" alt="Image" src="https://github.com/user-attachments/assets/34a58520-fdfc-4b28-8a89-e246e05ddaea" />
+
 ## How it works
 
 1. The bot grabs a camera snapshot via the Home Assistant API
