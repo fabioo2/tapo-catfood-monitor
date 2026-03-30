@@ -513,12 +513,20 @@ async def start(ctx):
     monitor_task = bot.loop.create_task(monitor_loop())
     log.info("Monitoring started by %s", ctx.author)
 
+    desc = (
+        f"Checking food bowl every **{POLL_INTERVAL_SEC // 60} minutes**.\n"
+        f"I'll alert you if the food drops below **{LOW_FOOD_THRESHOLD}%**."
+    )
+    if is_quiet_hours():
+        desc += (
+            f"\n\n**Note:** Quiet hours are active "
+            f"({QUIET_START_HOUR:02d}:00\u2013{QUIET_END_HOUR:02d}:00). "
+            f"Checks will begin once quiet hours end."
+        )
+
     await ctx.send(embed=discord.Embed(
         title="Monitoring Started",
-        description=(
-            f"Checking food bowl every **{POLL_INTERVAL_SEC // 60} minutes**.\n"
-            f"I'll alert you if the food drops below **{LOW_FOOD_THRESHOLD}%**."
-        ),
+        description=desc,
         color=discord.Color.green(),
     ))
 
