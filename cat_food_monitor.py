@@ -70,6 +70,7 @@ monitoring = False
 monitor_task = None
 last_analysis = None
 last_check_time = None
+last_image_bytes = None
 ha_down = False
 gemini_down = False
 camera_down = False
@@ -270,7 +271,7 @@ async def analyze_with_gemini(image_bytes):
 # Full analysis pipeline
 # ---------------------------------------------------------------------------
 async def analyze_food():
-    global last_analysis, last_check_time, consecutive_errors, error_alerted
+    global last_analysis, last_check_time, last_image_bytes, consecutive_errors, error_alerted
     try:
         image_bytes = await get_camera_snapshot()
         if image_bytes is None:
@@ -282,6 +283,7 @@ async def analyze_food():
 
         last_analysis = analysis
         last_check_time = datetime.now()
+        last_image_bytes = image_bytes
         consecutive_errors = 0
         error_alerted = False
 
@@ -452,6 +454,7 @@ async def on_ready():
             "`!start` - Start monitoring the food bowl\n"
             "`!stop` - Stop monitoring\n"
             "`!check` - One-time food level check\n"
+            "`!last` - Show the last checked image\n"
             "`!baseline` - Set baseline image for drift detection\n"
             "`!status` - Show bot status"
         ),
@@ -527,6 +530,7 @@ async def stop(ctx):
 @bot.command()
 async def check(ctx):
     """One-time check of cat food level."""
+    global alerted_empty
     log.info("Manual check requested by %s", ctx.author)
     async with ctx.typing():
         result = await analyze_food()
@@ -540,9 +544,36 @@ async def check(ctx):
         return
 
     image_bytes, analysis = result
+    food = analysis.get("food", False)
+    level = analysis.get("level", 0)
+
+    # Sync alert state so monitoring loop doesn't re-alert what user just saw
+    if not food or level <= LOW_FOOD_THRESHOLD:
+        alerted_empty = True
+    else:
+        alerted_empty = False
+
     embed = build_analysis_embed(analysis, manual=True)
     fname = snapshot_filename()
     file = discord.File(io.BytesIO(image_bytes), filename=fname)
+    embed.set_image(url=f"attachment://{fname}")
+    await ctx.send(embed=embed, file=file)
+
+
+@bot.command()
+async def last(ctx):
+    """Show the last checked image and analysis."""
+    if last_image_bytes is None or last_analysis is None:
+        await ctx.send(embed=discord.Embed(
+            description="No checks have been performed yet.",
+            color=discord.Color.orange(),
+        ))
+        return
+
+    embed = build_analysis_embed(last_analysis, manual=True)
+    embed.set_footer(text=f"Last checked at {last_check_time.strftime('%I:%M %p')}")
+    fname = snapshot_filename()
+    file = discord.File(io.BytesIO(last_image_bytes), filename=fname)
     embed.set_image(url=f"attachment://{fname}")
     await ctx.send(embed=embed, file=file)
 
