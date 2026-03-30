@@ -32,6 +32,14 @@ CAMERA_PRIVACY_MODE = os.environ.get("CAMERA_PRIVACY_MODE", "false").lower() == 
 CAMERA_WAKE_SEC = int(os.environ.get("CAMERA_WAKE_SEC", "5"))
 BASELINE_THRESHOLD = int(os.environ.get("BASELINE_THRESHOLD", "25"))
 BASELINE_PATH = Path(os.environ.get("BASELINE_PATH", "/app/data/baseline.jpg"))
+QUIET_START_HOUR = os.environ.get("QUIET_START_HOUR")  # e.g. "0" for midnight
+QUIET_END_HOUR = os.environ.get("QUIET_END_HOUR")      # e.g. "9" for 9 AM
+if QUIET_START_HOUR is not None and QUIET_END_HOUR is not None:
+    QUIET_START_HOUR = int(QUIET_START_HOUR)
+    QUIET_END_HOUR = int(QUIET_END_HOUR)
+else:
+    QUIET_START_HOUR = None
+    QUIET_END_HOUR = None
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -78,6 +86,17 @@ alerted_empty = False
 consecutive_errors = 0
 error_alerted = False
 baseline_alerted = False
+
+
+def is_quiet_hours():
+    """Return True if current time falls within the configured quiet window."""
+    if QUIET_START_HOUR is None or QUIET_END_HOUR is None:
+        return False
+    hour = datetime.now().hour
+    if QUIET_START_HOUR <= QUIET_END_HOUR:
+        return QUIET_START_HOUR <= hour < QUIET_END_HOUR
+    # Wraps midnight, e.g. 22 -> 6
+    return hour >= QUIET_START_HOUR or hour < QUIET_END_HOUR
 
 
 def snapshot_filename():
@@ -344,6 +363,11 @@ async def monitor_loop():
     log.info("Monitor loop started (interval=%ds)", POLL_INTERVAL_SEC)
 
     while monitoring and not bot.is_closed():
+        if is_quiet_hours():
+            log.debug("Quiet hours active (%02d:00–%02d:00), skipping check", QUIET_START_HOUR, QUIET_END_HOUR)
+            await asyncio.sleep(POLL_INTERVAL_SEC)
+            continue
+
         try:
             result = await analyze_food()
 
@@ -620,6 +644,8 @@ async def status(ctx):
         f"**Low food threshold:** {LOW_FOOD_THRESHOLD}%",
         f"**Camera:** `{CAMERA_ENTITY}`",
         f"**Gemini model:** `{GEMINI_MODEL}`",
+        f"**Quiet hours:** {f'{QUIET_START_HOUR:02d}:00–{QUIET_END_HOUR:02d}:00' if QUIET_START_HOUR is not None else 'Disabled'}"
+        f"{' (active now)' if is_quiet_hours() else ''}",
         f"**Baseline:** {'Set' if load_baseline() else 'Not set'} (threshold: {BASELINE_THRESHOLD}%)",
         f"**HA connected:** {'No' if ha_down else 'Yes'}",
         f"**Gemini connected:** {'No' if gemini_down else 'Yes'}",
