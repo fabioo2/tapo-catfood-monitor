@@ -23,6 +23,8 @@ If Home Assistant, the camera, or Gemini become unreachable, the bot alerts you 
 | `!start` | Start continuous monitoring (alerts only when food is low) |
 | `!stop` | Stop monitoring |
 | `!check` | One-time food level check with image |
+| `!last` | Show the last checked image and analysis |
+| `!baseline` | Set baseline image for camera drift detection |
 | `!status` | Show bot status and connection health |
 
 ## Prerequisites
@@ -79,7 +81,25 @@ All configuration is done through environment variables in `.env`. See `.env.exa
 | `LOW_FOOD_THRESHOLD` | `15` | Food level (%) that triggers an alert |
 | `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model to use |
 | `CAMERA_PRIVACY_MODE` | `false` | Turn camera on/off for each snapshot |
-| `CAMERA_WAKE_SEC` | `15` | Seconds to wait after turning camera on |
+| `CAMERA_WAKE_SEC` | `5` | Seconds to wait after turning camera on |
+| `BASELINE_THRESHOLD` | `25` | Image drift % before alerting camera may have moved |
+| `QUIET_START_HOUR` | *(disabled)* | Hour (0-23) to begin pausing monitoring |
+| `QUIET_END_HOUR` | *(disabled)* | Hour (0-23) to resume monitoring |
+
+### Quiet hours
+
+Set `QUIET_START_HOUR` and `QUIET_END_HOUR` to pause monitoring during a time window (e.g. overnight). Both must be set for the feature to activate — omitting either keeps monitoring running 24/7.
+
+```
+QUIET_START_HOUR=0   # midnight
+QUIET_END_HOUR=9     # 9 AM
+```
+
+The monitor loop stays running but skips all checks during quiet hours. Manual `!check` still works. Supports wrapping past midnight (e.g. `22` to `6`).
+
+### Baseline drift detection
+
+Use `!baseline` to save a reference image of the camera's current view. On each check, the bot compares the new snapshot to the baseline — if the image differs by more than `BASELINE_THRESHOLD`% it alerts you that the camera may have moved, since food readings could be unreliable.
 
 ### Privacy mode
 
