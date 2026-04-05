@@ -57,14 +57,19 @@ log = logging.getLogger("catfood")
 # ---------------------------------------------------------------------------
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+FOOD_LEVELS = {"empty": 0, "low": 20, "medium": 50, "full": 100}
+
 ANALYSIS_PROMPT = (
-    "Analyze this image of a cat food bowl. Determine:\n"
-    "1. Whether there is food visible in the bowl (true/false)\n"
-    "2. The estimated food level as a percentage (0-100)\n\n"
+    "Analyze this image of a cat food bowl. Classify the food level into "
+    "one of these categories:\n\n"
+    "- empty: No food visible, bowl is clean or nearly clean\n"
+    "- low: Small amount of food, bottom of the bowl is visible\n"
+    "- medium: Decent amount of food, covers most of the bowl\n"
+    "- full: Bowl is freshly filled or nearly full\n\n"
     "Respond with ONLY a JSON object in this exact format, no other text:\n"
-    '{"food": true, "level": 75}\n\n'
+    '{"food": true, "level": "medium"}\n\n'
     '- "food": true if any food is visible, false if the bowl appears empty\n'
-    '- "level": estimated fullness 0 (empty) to 100 (full)'
+    '- "level": one of "empty", "low", "medium", "full"'
 )
 
 # ---------------------------------------------------------------------------
@@ -275,7 +280,18 @@ async def analyze_with_gemini(image_bytes):
             gemini_down = False
             log.info("Gemini API connection restored")
 
-        log.info("Gemini analysis: food=%s, level=%s%%", result.get("food"), result.get("level"))
+        # Map bucket string to numeric level
+        raw_level = result.get("level", "empty")
+        if isinstance(raw_level, str):
+            result["level_label"] = raw_level
+            result["level"] = FOOD_LEVELS.get(raw_level.lower(), 0)
+        else:
+            # Fallback if model returns a number anyway
+            result["level_label"] = next(
+                (k for k, v in FOOD_LEVELS.items() if v == raw_level), "empty"
+            )
+
+        log.info("Gemini analysis: food=%s, level=%s (%s%%)", result.get("food"), result.get("level_label"), result.get("level"))
         return result
 
     except json.JSONDecodeError:
@@ -346,8 +362,9 @@ def build_analysis_embed(analysis, manual=False):
     filled = round(level / 10)
     bar = "\u2588" * filled + "\u2591" * (10 - filled)
 
+    label = analysis.get("level_label", "unknown").capitalize()
     embed.add_field(name="Food Present", value="Yes" if food else "No", inline=True)
-    embed.add_field(name="Level", value=f"{level}%", inline=True)
+    embed.add_field(name="Level", value=f"{label} ({level}%)", inline=True)
     embed.add_field(name="", value=f"`[{bar}]`", inline=False)
     embed.set_footer(text=f"Checked at {datetime.now().strftime('%I:%M %p')}")
     return embed
