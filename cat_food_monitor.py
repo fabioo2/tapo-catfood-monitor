@@ -27,6 +27,7 @@ CAMERA_SWITCH_ENTITY = f"switch.{CAMERA_NAME}"
 camera_config_entry_id = ""  # Auto-detected at startup
 POLL_INTERVAL_SEC = int(os.environ.get("POLL_INTERVAL_SEC", "600"))
 LOW_FOOD_THRESHOLD = int(os.environ.get("LOW_FOOD_THRESHOLD", "15"))
+REFILL_THRESHOLD = int(os.environ.get("REFILL_THRESHOLD", "40"))
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 CAMERA_PRIVACY_MODE = os.environ.get("CAMERA_PRIVACY_MODE", "false").lower() == "true"
 CAMERA_WAKE_SEC = int(os.environ.get("CAMERA_WAKE_SEC", "5"))
@@ -419,7 +420,7 @@ async def monitor_loop():
                     await channel.send(embed=embed, file=file)
                     log.warning("Low food alert sent: food=%s, level=%s%%", food, level)
 
-                elif food and level > LOW_FOOD_THRESHOLD and alerted_empty:
+                elif food and level >= REFILL_THRESHOLD and alerted_empty:
                     alerted_empty = False
                     embed = discord.Embed(
                         title="Food Bowl Refilled!",
@@ -518,7 +519,8 @@ async def start(ctx):
 
     desc = (
         f"Checking food bowl every **{POLL_INTERVAL_SEC // 60} minutes**.\n"
-        f"I'll alert you if the food drops below **{LOW_FOOD_THRESHOLD}%**."
+        f"I'll alert you if the food drops below **{LOW_FOOD_THRESHOLD}%** "
+        f"(refilled at **{REFILL_THRESHOLD}%**)."
     )
     if is_quiet_hours():
         desc += (
@@ -582,7 +584,7 @@ async def check(ctx):
     # Sync alert state so monitoring loop doesn't re-alert what user just saw
     if not food or level <= LOW_FOOD_THRESHOLD:
         alerted_empty = True
-    else:
+    elif level >= REFILL_THRESHOLD:
         alerted_empty = False
 
     embed = build_analysis_embed(analysis, manual=True)
@@ -649,7 +651,7 @@ async def status(ctx):
     lines = [
         f"**Monitoring:** {'Active' if monitoring else 'Inactive'}",
         f"**Poll interval:** {POLL_INTERVAL_SEC // 60} minutes",
-        f"**Low food threshold:** {LOW_FOOD_THRESHOLD}%",
+        f"**Low food threshold:** {LOW_FOOD_THRESHOLD}% (refill: {REFILL_THRESHOLD}%)",
         f"**Camera:** `{CAMERA_ENTITY}`",
         f"**Gemini model:** `{GEMINI_MODEL}`",
         f"**Quiet hours:** {f'{QUIET_START_HOUR:02d}:00–{QUIET_END_HOUR:02d}:00' if QUIET_START_HOUR is not None else 'Disabled'}"
